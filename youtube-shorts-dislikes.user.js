@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Shorts Dislike Returner
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Zeigt die Dislikes bei YouTube Shorts wieder an.
+// @version      1.4
+// @description  Zeigt die Dislikes bei YouTube Shorts wieder an (eigener Button, da YouTube keinen Dislike-Button mehr rendert).
 // @author       Dein Name
 // @match        https://www.youtube.com/*
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
@@ -16,42 +16,56 @@
     // ---------- Styles ----------
     const style = document.createElement('style');
     style.innerHTML = `
-        .my-custom-dislike-counter {
+        .my-dislike-btn-wrapper {
+            display: flex !important;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            margin: 8px 0 !important;
+        }
+        .my-dislike-btn-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #f1f1f1;
+        }
+        .my-dislike-btn-icon svg {
+            width: 24px;
+            height: 24px;
+            fill: #f1f1f1;
+        }
+        .my-dislike-btn-count {
             color: #f1f1f1 !important;
             font-size: 12px !important;
             font-family: "Roboto", Arial, sans-serif;
             font-weight: 400;
-            margin-top: 6px !important;
-            display: block !important;
+            margin-top: 4px !important;
             text-align: center !important;
-            width: 100%;
-            pointer-events: none;
+        }
+        .my-dislike-btn-count.loading {
+            opacity: 0.5;
         }
     `;
     document.documentElement.appendChild(style);
 
-    // ---------- Cache & Zustand ----------
-    const cache = new Map();       // videoId -> dislikes (oder null bei Fehler)
-    const pending = new Set();     // videoIds, für die gerade ein Request läuft
-    let lastAppliedId = null;
+    // Material-Icon "thumb_down" (Standard-Icon, keine YouTube-eigene Grafik)
+    const THUMB_DOWN_SVG = `<svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>`;
 
-    // Der Umriss-Pfad des Dislike-Icons ist sprachunabhängig, dient als
-    // zuverlässiger Fallback falls das aria-label nicht erkannt wird.
-    const DISLIKE_PATH_HINT = 'M12 5';
-    const DISLIKE_LABELS = [
-        'dislike', 'nicht mögen', 'no me gusta', 'je n’aime pas', "je n'aime pas",
-        'non mi piace', 'não gostei', 'niet leuk', 'nie podoba', 'не нравится',
-        '低評価', '싫어요', '不喜欢', '不喜歡'
-    ];
+    // ---------- Cache & Zustand ----------
+    const cache = new Map();
+    const pending = new Set();
+
+    const LIKE_LABEL_HINTS = ['liken', 'gefällt mir', 'like this', 'i like this'];
 
     function getShortsVideoId() {
         const match = window.location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
         return match ? match[1] : null;
     }
 
-    // Ermittelt den aktuell sichtbaren Shorts-Renderer (nicht die
-    // vorgeladenen Nachbar-Videos), damit der Zähler nie am falschen
-    // Video angebracht wird.
     function getActiveShortsRenderer() {
         const renderers = document.querySelectorAll('ytd-reel-video-renderer');
         let best = null;
@@ -70,21 +84,36 @@
         return best;
     }
 
-    function findDislikeButton(root) {
+    function findLikeButton(root) {
         if (!root) return null;
         const buttons = root.querySelectorAll('button');
         for (const btn of buttons) {
             const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-            if (DISLIKE_LABELS.some(l => label.includes(l))) return btn;
-        }
-        // Fallback über das Icon-Pfad-Fragment
-        for (const btn of buttons) {
-            const path = btn.querySelector('svg path');
-            if (path && path.getAttribute('d') && path.getAttribute('d').startsWith(DISLIKE_PATH_HINT)) {
-                return btn;
-            }
+            if (!label) continue;
+            if (label.includes('dislike') || label.includes('nicht mögen')) continue;
+            if (LIKE_LABEL_HINTS.some(l => label.includes(l))) return btn;
         }
         return null;
+    }
+
+    // Findet den "Aktions-Block" (Like/Kommentar/Teilen/Remix stehen
+    // typischerweise als Geschwister-Elemente in einem gemeinsamen
+    // Container). Gibt sowohl den Container als auch das Like-Element
+    // (das Kind, direkt unter dem Container) zurück.
+    function findActionItem(likeButton) {
+        let el = likeButton;
+        for (let i = 0; i < 6 && el && el.parentElement; i++) {
+            const parent = el.parentElement;
+            const buttonSiblings = Array.from(parent.children).filter(
+                c => c.tagName === 'BUTTON' || (c.querySelector && c.querySelector('button'))
+            );
+            if (buttonSiblings.length >= 2) {
+                return { container: parent, item: el };
+            }
+            el = parent;
+        }
+        // Fallback: direkter Elternknoten des Buttons
+        return { container: likeButton.parentElement, item: likeButton };
     }
 
     function gmFetch(url) {
@@ -109,7 +138,6 @@
                     ontimeout: () => resolve(null)
                 });
             } else {
-                // Fallback ohne GM_xmlhttpRequest
                 fetch(url).then(r => r.ok ? r.json() : null).then(resolve).catch(() => resolve(null));
             }
         });
@@ -117,7 +145,7 @@
 
     async function fetchDislikes(videoId) {
         if (cache.has(videoId)) return cache.get(videoId);
-        if (pending.has(videoId)) return null; // Request läuft bereits
+        if (pending.has(videoId)) return undefined;
         pending.add(videoId);
         try {
             const data = await gmFetch(`https://returnyoutubedislikeapi.com/votes?videoId=${videoId}`);
@@ -129,51 +157,73 @@
         }
     }
 
-    function removeAllCounters() {
-        document.querySelectorAll('.my-custom-dislike-counter').forEach(el => el.remove());
+    function ensureDislikeElement(container, afterItem, videoId) {
+        let el = container.querySelector('.my-dislike-btn-wrapper');
+        if (el && el.dataset.videoId === videoId) return el;
+
+        if (el) el.remove();
+
+        el = document.createElement('div');
+        el.className = 'my-dislike-btn-wrapper';
+        el.dataset.videoId = videoId;
+        el.innerHTML = `
+            <div class="my-dislike-btn-icon">${THUMB_DOWN_SVG}</div>
+            <div class="my-dislike-btn-count loading">…</div>
+        `;
+        afterItem.insertAdjacentElement('afterend', el);
+        return el;
     }
+
+    function removeAllCounters() {
+        document.querySelectorAll('.my-dislike-btn-wrapper').forEach(el => el.remove());
+    }
+
+    let lastVideoId = null;
 
     async function updateShortsUI() {
         const videoId = getShortsVideoId();
         if (!videoId) {
-            if (lastAppliedId !== null) {
+            if (lastVideoId !== null) {
                 removeAllCounters();
-                lastAppliedId = null;
+                lastVideoId = null;
             }
             return;
         }
 
         const renderer = getActiveShortsRenderer();
-        const dislikeButton = findDislikeButton(renderer || document);
-        if (!dislikeButton) return;
+        const likeButton = findLikeButton(renderer || document);
+        if (!likeButton) return;
 
-        if (dislikeButton.dataset.hasCustomDislike === videoId) return;
+        const { container, item } = findActionItem(likeButton);
+        if (!container || !item) return;
+
+        const el = ensureDislikeElement(container, item, videoId);
+        const countEl = el.querySelector('.my-dislike-btn-count');
 
         let dislikes = cache.get(videoId);
         if (dislikes === undefined) {
+            countEl.textContent = '…';
+            countEl.classList.add('loading');
             dislikes = await fetchDislikes(videoId);
-            if (dislikes === undefined || dislikes === null) return;
+            if (dislikes === undefined) return; // Request lief bereits, später erneut versuchen
         }
-        if (dislikes === null) return;
 
-        // Zwischenzeitlich könnte der Nutzer weitergescrollt sein.
+        // Falls der Nutzer inzwischen weitergescrollt ist, nichts mehr anfassen.
         if (getShortsVideoId() !== videoId) return;
 
+        if (dislikes === null) {
+            countEl.textContent = '–';
+            countEl.classList.remove('loading');
+            return;
+        }
+
         const formatted = new Intl.NumberFormat('de-DE', { notation: 'compact' }).format(dislikes);
-
-        // Alte Zähler in diesem Button (und ggf. verwaiste woanders) entfernen
-        const oldCounter = dislikeButton.querySelector('.my-custom-dislike-counter');
-        if (oldCounter) oldCounter.remove();
-
-        const customCounter = document.createElement('div');
-        customCounter.className = 'my-custom-dislike-counter';
-        customCounter.innerText = formatted;
-        dislikeButton.appendChild(customCounter);
-        dislikeButton.dataset.hasCustomDislike = videoId;
-        lastAppliedId = videoId;
+        countEl.textContent = formatted;
+        countEl.classList.remove('loading');
+        lastVideoId = videoId;
     }
 
-    // ---------- Trigger: MutationObserver + Intervall als Sicherheitsnetz ----------
+    // ---------- Trigger ----------
     let scheduled = false;
     function schedule() {
         if (scheduled) return;
@@ -194,11 +244,9 @@
     }
     startObserving();
 
-    // Reagiert auch auf SPA-Navigation (History-API) von YouTube
     ['yt-navigate-finish', 'popstate'].forEach(evt =>
         window.addEventListener(evt, schedule)
     );
 
-    // Sicherheitsnetz, falls mal ein Event verpasst wird
     setInterval(updateShortsUI, 1000);
 })();
